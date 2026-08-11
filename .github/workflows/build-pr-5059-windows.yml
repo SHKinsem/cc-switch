@@ -1,0 +1,85 @@
+name: Build PR 5059 for Windows
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-pr-5059-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout upstream PR 5059
+        uses: actions/checkout@v6
+        with:
+          repository: farion1231/cc-switch
+          ref: refs/pull/5059/head
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        shell: pwsh
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create unsigned-build configuration
+        shell: pwsh
+        run: |
+          @'
+          {
+            "bundle": {
+              "createUpdaterArtifacts": false
+            }
+          }
+          '@ | Set-Content -Path ci.tauri.conf.json -Encoding utf8
+
+      - name: Build unsigned Windows MSI and executable
+        shell: pwsh
+        run: pnpm tauri build --bundles msi --config ci.tauri.conf.json
+
+      - name: Prepare portable build and installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+
+          Copy-Item "src-tauri/target/release/cc-switch.exe" "portable/cc-switch.exe"
+          Set-Content -Path "portable/portable.ini" -Value "portable=true" -Encoding ascii
+          Compress-Archive -Path "portable/*" -DestinationPath "artifacts/CC-Switch-PR-5059-Windows-Portable.zip" -Force
+
+          $msi = Get-ChildItem "src-tauri/target/release/bundle/msi" -Filter "*.msi" -Recurse | Select-Object -First 1
+          if ($null -ne $msi) {
+            Copy-Item $msi.FullName "artifacts/CC-Switch-PR-5059-Windows.msi"
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: CC-Switch-PR-5059-Windows-x64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
