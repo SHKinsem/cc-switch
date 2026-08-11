@@ -1,0 +1,206 @@
+name: Build fork update channel
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-update-channel
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: farion1231/cc-switch
+  UPSTREAM_PR: "5059"
+  UPDATER_PUBKEY: "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg2M0EzNDlGODZGNzAxQkEKUldTNkFmZUduelE2aHRPZE9tYjBDdXZnL1U3RnNPVGJ5UitvWjk2Ulp4RDM3TWRjbHBDaXVwdFcK"
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v6
+        with:
+          repository: farion1231/cc-switch
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare upstream release and PR patch
+        id: meta
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $release = gh api "repos/$env:UPSTREAM_REPO/releases/latest" | ConvertFrom-Json
+          $upstreamTag = [string]$release.tag_name
+          if ($upstreamTag -notmatch '^v?(\d+)\.(\d+)\.(\d+)$') {
+            throw "Unsupported upstream version tag: $upstreamTag"
+          }
+
+          $major = [int]$Matches[1]
+          $minor = [int]$Matches[2]
+          $patch = [int]$Matches[3] + 1
+          $customVersion = "$major.$minor.$patch-pr5059.$env:GITHUB_RUN_NUMBER"
+
+          $tagRef = "refs/tags/" + $upstreamTag + ":refs/tags/" + $upstreamTag
+          $prRef = "refs/pull/" + $env:UPSTREAM_PR + "/head:refs/remotes/origin/pr-" + $env:UPSTREAM_PR
+          git fetch origin $tagRef --force
+          git fetch origin $prRef --force
+
+          $prHead = (git rev-parse "origin/pr-$env:UPSTREAM_PR").Trim()
+          $prShort = $prHead.Substring(0, 10)
+          $releaseTag = "fork-$upstreamTag-pr$env:UPSTREAM_PR-$prShort"
+
+          gh release view $releaseTag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "skip=true" | Add-Content -Path $env:GITHUB_OUTPUT
+            "release_tag=$releaseTag" | Add-Content -Path $env:GITHUB_OUTPUT
+            Write-Host "Release $releaseTag already exists; nothing changed."
+            exit 0
+          }
+
+          git checkout --detach $upstreamTag
+
+          $mergeBase = (git merge-base origin/main "origin/pr-$env:UPSTREAM_PR").Trim()
+          $patchPath = Join-Path $env:RUNNER_TEMP "pr-$env:UPSTREAM_PR.patch"
+          git diff --binary $mergeBase "origin/pr-$env:UPSTREAM_PR" -- src-tauri/src/proxy/providers/streaming.rs src-tauri/src/proxy/response_processor.rs | Out-File -FilePath $patchPath -Encoding utf8NoBOM
+
+          if ((Get-Item $patchPath).Length -gt 0) {
+            git apply --3way --whitespace=nowarn $patchPath
+            Write-Host "Applied source-only patch from upstream PR $env:UPSTREAM_PR."
+          } else {
+            Write-Host "PR source diff is empty; the fix may already be upstream."
+          }
+
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content -Raw $configPath | ConvertFrom-Json
+          $config.version = $customVersion
+          $config.bundle.createUpdaterArtifacts = $true
+          $config.plugins.updater.pubkey = $env:UPDATER_PUBKEY
+          $config.plugins.updater.endpoints = @(
+            "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/latest.json"
+          )
+          $config | ConvertTo-Json -Depth 100 | Set-Content -Path $configPath -Encoding utf8
+
+          "skip=false" | Add-Content -Path $env:GITHUB_OUTPUT
+          "custom_version=$customVersion" | Add-Content -Path $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" | Add-Content -Path $env:GITHUB_OUTPUT
+          "upstream_tag=$upstreamTag" | Add-Content -Path $env:GITHUB_OUTPUT
+          "pr_head=$prHead" | Add-Content -Path $env:GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        if: steps.meta.outputs.skip != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        if: steps.meta.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        if: steps.meta.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Install dependencies
+        if: steps.meta.outputs.skip != 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build signed updater and MSI
+        if: steps.meta.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: pnpm tauri build --bundles msi
+
+      - name: Prepare release assets
+        if: steps.meta.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          CUSTOM_VERSION: ${{ steps.meta.outputs.custom_version }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+          PR_HEAD: ${{ steps.meta.outputs.pr_head }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          $msi = Get-ChildItem "src-tauri/target/release/bundle/msi" -Filter "*.msi" -Recurse | Select-Object -First 1
+          if ($null -eq $msi) {
+            throw "MSI bundle was not generated."
+          }
+
+          $sigPath = "$($msi.FullName).sig"
+          if (-not (Test-Path $sigPath)) {
+            throw "Tauri updater signature was not generated for $($msi.Name)."
+          }
+
+          $msiName = "CC-Switch-$env:CUSTOM_VERSION-Windows.msi"
+          Copy-Item $msi.FullName "release-assets/$msiName"
+          Copy-Item $sigPath "release-assets/$msiName.sig"
+
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item "src-tauri/target/release/cc-switch.exe" "portable/cc-switch.exe"
+          Set-Content -Path "portable/portable.ini" -Value "portable=true" -Encoding ascii
+          Compress-Archive -Path "portable/*" -DestinationPath "release-assets/CC-Switch-$env:CUSTOM_VERSION-Windows-Portable.zip" -Force
+
+          $signature = (Get-Content -Raw "release-assets/$msiName.sig").Trim()
+          $downloadUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$msiName"
+          $manifest = [ordered]@{
+            version = $env:CUSTOM_VERSION
+            notes = "Fork build based on $env:UPSTREAM_TAG with upstream PR #$env:UPSTREAM_PR applied."
+            pub_date = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url = $downloadUrl
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path "release-assets/latest.json" -Encoding utf8
+
+          @(
+            "Upstream release: $env:UPSTREAM_TAG"
+            "Applied PR: https://github.com/$env:UPSTREAM_REPO/pull/$env:UPSTREAM_PR"
+            "PR head: $env:PR_HEAD"
+            "Custom version: $env:CUSTOM_VERSION"
+            ""
+            "This is an unofficial, unsigned Windows build. The Tauri updater payload is"
+            "cryptographically signed for this fork, but the MSI has no Authenticode certificate."
+          ) | Set-Content -Path "release-notes.txt" -Encoding utf8
+
+      - name: Upload workflow artifact
+        if: steps.meta.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: CC-Switch-${{ steps.meta.outputs.custom_version }}-Windows-x64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish fork release
+        if: steps.meta.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          CUSTOM_VERSION: ${{ steps.meta.outputs.custom_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = Get-ChildItem -File release-assets | ForEach-Object { $_.FullName }
+          gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --title "CC Switch $env:CUSTOM_VERSION (PR #$env:UPSTREAM_PR)" --notes-file release-notes.txt --latest
